@@ -1,0 +1,19 @@
+[app]
+name = "miniflux"
+version = "0.1.0"
+description = "Miniflux minimalist RSS reader with built-in PostgreSQL"
+
+[runtime.container]
+image = "Dockerfile"
+port = 8080
+
+[routing]
+health_check = "/healthcheck"
+public_paths = ["/"]
+
+[resources]
+memory_mb = 512
+cpu_millicores = 250
+
+[data]
+app_data = true
