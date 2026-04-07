@@ -79,6 +79,7 @@ export CREATE_ADMIN=1
 export ADMIN_USERNAME=admin
 export ADMIN_PASSWORD="$ADMIN_PASS"
 export LISTEN_ADDR=0.0.0.0:8080
+export FORCE_REFRESH_INTERVAL=0
 
 # Derive base URL from OpenHost environment variables
 if [ -n "$OPENHOST_ZONE_DOMAIN" ]; then
