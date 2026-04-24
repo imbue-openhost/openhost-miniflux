@@ -224,8 +224,10 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     miniflux_host: str = "127.0.0.1"
     miniflux_port: int = 8081
 
-    # Override logging to route through our logger and skip noisy 200s to
-    # /healthcheck so the router probe doesn't flood the log.
+    # Route request logs through our logger so they're interleaved with
+    # the module's own log lines, and suppress logs for /healthcheck entirely
+    # (successful and otherwise) so the OpenHost router's liveness probes
+    # don't flood the container log with ~1 line/second.
     def log_message(self, format: str, *args) -> None:  # noqa: A002, N802
         path = getattr(self, "path", "")
         if path.startswith("/healthcheck"):
@@ -342,6 +344,22 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         self.send_error(400, "request body read failed")
                     except OSError:
                         # Client is already gone; nothing left to say.
+                        pass
+                    return
+                if len(body) != length:
+                    # Short read: the client closed the socket before
+                    # sending the full body they promised. We must not
+                    # silently forward a truncated body with a shorter
+                    # Content-Length header — Miniflux would accept the
+                    # truncated request as if it were complete.
+                    log.info(
+                        "short read: expected %d bytes, got %d",
+                        length,
+                        len(body),
+                    )
+                    try:
+                        self.send_error(400, "incomplete request body")
+                    except OSError:
                         pass
                     return
             else:

@@ -169,7 +169,11 @@ def test_first_value_wins_on_duplicate_names():
     assert c["zone_auth"] == "valid-token"
 
 
-def test_malformed_parts_are_skipped():
+def test_parts_without_equals_sign_are_skipped():
+    """Only parts missing the `=` separator are dropped; parts with an
+    empty name (`=value`) are retained under the key `""`. We accept this
+    slight liberality because real cookie headers never produce it and we
+    don't want to complicate the parser."""
     c = auth_proxy._parse_cookie_header("no-equals-sign; foo=bar; =empty-name")
     assert c == {"foo": "bar", "": "empty-name"}
 
