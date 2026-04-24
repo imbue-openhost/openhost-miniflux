@@ -288,11 +288,16 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         if is_owner:
             cleaned_headers.append((AUTH_HEADER_NAME, "admin"))
 
-        # Forward to miniflux on localhost. We cannot stream a request body
-        # that uses Transfer-Encoding: chunked (hop-by-hop header), so if
-        # Content-Length is absent we read into memory up to MAX_BODY_BYTES
-        # and re-send with Content-Length. Miniflux requests from the browser
-        # all use Content-Length (form submits, JSON POSTs).
+        # Reject chunked transfer encoding outright. We buffer the body into
+        # a new Content-Length request; forwarding the raw chunked bytes as
+        # a plain body would corrupt the upstream's parse, and implementing
+        # dechunking here duplicates what the fronting OpenHost router
+        # (httpx-based) already does before it reaches us.
+        transfer_encoding = self.headers.get("Transfer-Encoding", "").lower().strip()
+        if transfer_encoding and transfer_encoding != "identity":
+            self.send_error(411, "Length Required (Transfer-Encoding unsupported)")
+            return
+
         body: bytes | None = None
         content_length_header = self.headers.get("Content-Length")
         if content_length_header:
@@ -311,12 +316,13 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 return
             body = self.rfile.read(length) if length > 0 else b""
         elif self.command in ("POST", "PUT", "PATCH", "DELETE"):
-            # No Content-Length: read whatever's there with the same cap. If
-            # the socket actually has more than the cap buffered, the excess
-            # will be left on the wire; http.server won't reuse the
-            # connection (it always closes after each request by default) so
-            # this doesn't desync a pipeline.
-            body = self.rfile.read(self.MAX_BODY_BYTES)
+            # Body method with no Content-Length and no Transfer-Encoding.
+            # The HTTP spec says this means "no body" for a request (unlike a
+            # response, which can use connection-close framing). Forward an
+            # empty body rather than blocking waiting for EOF, which would
+            # otherwise let a slow client tie up a handler thread until the
+            # 60s socket timeout fires.
+            body = b""
 
         # The outer try/finally guarantees the upstream socket is always
         # released, even if conn.request() or getresponse() raises. We use
