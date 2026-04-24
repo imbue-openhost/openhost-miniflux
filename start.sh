@@ -1,4 +1,7 @@
-#!/bin/sh
+#!/bin/bash
+# `bash` (not `sh`) is required: we rely on `wait -n` to block until the
+# first of two backgrounded processes exits so we can tear down the other
+# one cleanly. Alpine's /bin/sh (busybox ash) does not support `wait -n`.
 set -e
 
 PERSIST="${OPENHOST_APP_DATA_DIR:-/data}"
@@ -54,11 +57,9 @@ if ! su postgres -c "psql -h /run/postgresql -tAc \"SELECT 1 FROM pg_database WH
     su postgres -c "psql -h /run/postgresql -d miniflux -c 'CREATE EXTENSION IF NOT EXISTS hstore'"
 fi
 
-# ---------------------------------------------------------------------------
-# One-time cleanup: remove the now-unused admin password file left behind
-# by previous versions of this app.  The zone owner authenticates via
-# OpenHost SSO now; there is no local password to stash.
-# ---------------------------------------------------------------------------
+# Remove the legacy admin password file. Authentication is handled by the
+# OpenHost zone's SSO; this file is never written by current code and is
+# cleared here so it cannot be mistaken for a live credential.
 rm -f "$PERSIST/.admin_password"
 
 # ---------------------------------------------------------------------------
@@ -104,8 +105,10 @@ if [ -n "$OPENHOST_ZONE_DOMAIN" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Launch miniflux in the background, then the auth-proxy sidecar in the
-# foreground. If either exits, kill both so OpenHost restarts the container.
+# Launch both processes under the shell so we can supervise them together.
+# The shell stays PID 1, catches SIGTERM from Docker/OpenHost, forwards it
+# to both children, and reaps them. If either child exits the whole
+# container exits too so OpenHost can restart it.
 # ---------------------------------------------------------------------------
 echo "[start.sh] Starting miniflux on 127.0.0.1:8081"
 /usr/bin/miniflux &
@@ -127,7 +130,21 @@ if ! kill -0 "$MINIFLUX_PID" 2>/dev/null; then
     exit $?
 fi
 
-trap 'kill -TERM "$MINIFLUX_PID" 2>/dev/null; wait' TERM INT
-
 echo "[start.sh] Starting auth-proxy on 0.0.0.0:8080"
-exec /opt/auth-venv/bin/python3 /app/auth_proxy.py
+/opt/auth-venv/bin/python3 /app/auth_proxy.py &
+PROXY_PID=$!
+
+# Forward SIGTERM / SIGINT to both children so the container stops cleanly.
+# Note: `exec` would have discarded this trap, so we keep the shell alive as
+# PID 1 and use `wait -n` to block until one of the two processes exits.
+trap 'kill -TERM "$MINIFLUX_PID" "$PROXY_PID" 2>/dev/null; wait' TERM INT
+
+# Block until either child exits, then tear down the survivor and exit with
+# the first child's status. `wait -n` (bash/dash/busybox ash all support it)
+# returns as soon as any backgrounded job finishes.
+wait -n "$MINIFLUX_PID" "$PROXY_PID"
+EXIT_CODE=$?
+echo "[start.sh] Child exited (code=$EXIT_CODE); stopping container"
+kill -TERM "$MINIFLUX_PID" "$PROXY_PID" 2>/dev/null || true
+wait
+exit "$EXIT_CODE"

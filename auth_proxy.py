@@ -12,11 +12,10 @@ first such request, Miniflux auto-creates the admin account
 
 Why not trust `X-OpenHost-Is-Owner`? The OpenHost router passes client-supplied
 headers through to apps on public paths and overwrites X-OpenHost-Is-Owner only
-for authenticated owners. Non-owner visitors to a public path could forge the
-header. Miniflux exposes no public paths today, so the header would be usable
-in this app, but we mirror the mirotalk pattern — verify a signed JWT ourselves
-— so the app stays safe even if routing behavior changes or a `public_paths`
-entry is added later.
+for authenticated owners. Non-owner visitors to a public path (Miniflux's
+`/healthcheck` is listed in `openhost.toml`'s `public_paths`) could forge the
+header. We mirror the mirotalk pattern — verify a signed JWT ourselves — so the
+app stays safe regardless of which paths are public.
 
 We deliberately strip any incoming X-Openhost-User header on every request so
 that a hostile upstream or client cannot inject auth by setting it themselves.
@@ -150,8 +149,10 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
         return False
     try:
         keys = jwks.get()
-    except Exception:  # noqa: BLE001
-        # No keys available and nothing cached. Fail closed.
+    except Exception as exc:  # noqa: BLE001
+        # No keys available and nothing cached. Fail closed, but surface the
+        # reason so an operator investigating "I can't log in" has a trail.
+        log.warning("JWKS unavailable; denying owner check: %s", exc)
         return False
 
     # Try each key; RS256 verification, require exp claim, no audience check
@@ -216,6 +217,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._proxy()
 
+    # Cap on request-body memory so a crafted or buggy client cannot drive the
+    # proxy OOM by sending `Content-Length: 2147483647`. 32 MiB comfortably
+    # covers Miniflux form submits (including OPML uploads on the order of a
+    # few MiB). Requests larger than this get a 413.
+    MAX_BODY_BYTES = 32 * 1024 * 1024
+
     def _proxy(self) -> None:
         # Always drop any client-supplied auth header so it cannot be spoofed.
         cleaned_headers = _strip_headers(self.headers.items(), {AUTH_HEADER_NAME})
@@ -227,12 +234,11 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         if is_owner:
             cleaned_headers.append((AUTH_HEADER_NAME, "admin"))
 
-        # Forward to miniflux on localhost. We cannot rely on http.client to
-        # stream a request body that uses Transfer-Encoding: chunked because
-        # that header is hop-by-hop and we'd have to re-chunk on the way out,
-        # so if Content-Length is absent we read into memory up to a generous
-        # cap and re-send with Content-Length. Miniflux requests from the
-        # browser use Content-Length already (form submits, JSON POSTs).
+        # Forward to miniflux on localhost. We cannot stream a request body
+        # that uses Transfer-Encoding: chunked (hop-by-hop header), so if
+        # Content-Length is absent we read into memory up to MAX_BODY_BYTES
+        # and re-send with Content-Length. Miniflux requests from the browser
+        # all use Content-Length (form submits, JSON POSTs).
         body: bytes | None = None
         content_length_header = self.headers.get("Content-Length")
         if content_length_header:
@@ -244,49 +250,59 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             if length < 0:
                 self.send_error(400, "negative Content-Length")
                 return
+            if length > self.MAX_BODY_BYTES:
+                # Reject before allocating. Without this cap a hostile client
+                # could advertise a multi-GiB body and exhaust container RAM.
+                self.send_error(413, "request body too large")
+                return
             body = self.rfile.read(length) if length > 0 else b""
         elif self.command in ("POST", "PUT", "PATCH", "DELETE"):
-            # No Content-Length: read whatever's there with a cap. 32 MiB is
-            # well above OPML-import and typical Miniflux form POSTs.
-            cap = 32 * 1024 * 1024
-            body = self.rfile.read(cap)
+            # No Content-Length: read whatever's there with the same cap. If
+            # the socket actually has more than the cap buffered, the excess
+            # will be left on the wire; http.server won't reuse the
+            # connection (it always closes after each request by default) so
+            # this doesn't desync a pipeline.
+            body = self.rfile.read(self.MAX_BODY_BYTES)
 
+        # Single try/finally around the whole upstream interaction guarantees
+        # the socket is released on every exit path (including getresponse
+        # errors, which earlier versions of this code leaked).
+        conn = http.client.HTTPConnection(
+            self.miniflux_host, self.miniflux_port, timeout=60
+        )
         try:
-            conn = http.client.HTTPConnection(
-                self.miniflux_host, self.miniflux_port, timeout=60
-            )
-            conn.request(
-                self.command,
-                self.path,
-                body=body,
-                headers=dict(cleaned_headers),
-            )
-            upstream = conn.getresponse()
-        except (OSError, http.client.HTTPException) as exc:
-            log.warning("upstream error: %s", exc)
-            self.send_error(502, "Bad Gateway")
-            return
+            try:
+                conn.request(
+                    self.command,
+                    self.path,
+                    body=body,
+                    headers=dict(cleaned_headers),
+                )
+                upstream = conn.getresponse()
+            except (OSError, http.client.HTTPException) as exc:
+                log.warning("upstream error: %s", exc)
+                self.send_error(502, "Bad Gateway")
+                return
 
-        # Stream the response back to the client. Remove hop-by-hop headers
-        # and let our own server compute Content-Length / chunking.
-        try:
-            payload = upstream.read()
+            try:
+                payload = upstream.read()
+            finally:
+                upstream.close()
+
+            self.send_response(upstream.status, upstream.reason)
+            for key, value in upstream.getheaders():
+                if key.lower() in HOP_BY_HOP_HEADERS:
+                    continue
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                # Client went away mid-response; nothing to do.
+                pass
         finally:
-            upstream.close()
             conn.close()
-
-        self.send_response(upstream.status, upstream.reason)
-        for key, value in upstream.getheaders():
-            if key.lower() in HOP_BY_HOP_HEADERS:
-                continue
-            self.send_header(key, value)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        try:
-            self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError):
-            # Client went away mid-response; nothing to do.
-            pass
 
 
 class DualStackServer(ThreadingHTTPServer):
