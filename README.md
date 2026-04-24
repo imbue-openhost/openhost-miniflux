@@ -49,6 +49,33 @@ Because `DISABLE_LOCAL_AUTH=1`, these APIs cannot be used with a username/passwo
 
 Needs ~512 MB RAM (Miniflux ~30 MB + PostgreSQL ~100-200 MB + sidecar ~30 MB + headroom) and 0.25 CPU cores.
 
+## Smoke testing a deployment
+
+After `oh app deploy`, verify the SSO gate from an authenticated session (owner) and an unauthenticated session:
+
+```bash
+# With a valid zone_auth cookie from the zone's /login flow:
+curl -b cookies.txt -IL https://miniflux.<zone-domain>/
+# Should end in 200 at /unread (you are the owner, auto-signed-in as admin).
+
+# Without any cookies:
+curl -IL https://miniflux.<zone-domain>/
+# Should end at the OpenHost zone's /login page.
+
+# Header spoofing attempt:
+curl -IL -H "X-Openhost-User: admin" https://miniflux.<zone-domain>/
+# Should also end at the zone login — the sidecar strips the header.
+```
+
+## Development
+
+Unit tests (pure helpers; JWT verification, cookie parsing):
+
+```bash
+pip install 'PyJWT[crypto]==2.9.0' requests pytest cryptography
+pytest tests/ -q
+```
+
 ## Files
 
 - `Dockerfile` — multi-stage build: extracts Miniflux binary, adds PostgreSQL and a Python venv with `PyJWT[crypto]` + `requests` on Alpine.

@@ -1,11 +1,10 @@
 """Unit tests for the auth_proxy helper functions.
 
-Run: `pip install 'PyJWT[crypto]==2.9.0' requests pytest`, then
-`pytest tests/ -q` from the repo root.
+Setup and invocation are documented in the README's "Development" section.
 
 Scope: the pure helpers that matter for security — JWT verification, cookie
 parsing, and header stripping. The HTTP handler's socket I/O is exercised
-at deploy time by smoke-testing an actual deployed instance (see README).
+at deploy time via the smoke-test commands in the README.
 """
 
 from __future__ import annotations

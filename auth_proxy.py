@@ -407,19 +407,27 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(502, "Bad Gateway")
                 return
 
-            # Read the upstream body into memory. We have to buffer anyway
-            # because we rewrite Content-Length, and streaming would mean
-            # handling Transfer-Encoding: chunked end-to-end. A read failure
-            # here gets the same treatment as a failure during the request
-            # phase: log and return 502 if we haven't written headers yet.
+            # Read the upstream body into memory, capped at the same limit
+            # we enforce on request bodies. A compromised or misbehaving
+            # Miniflux streaming an oversized response could otherwise
+            # exhaust container RAM. `read(MAX_BODY_BYTES + 1)` lets us
+            # distinguish "cap reached, probably more available" from
+            # "legitimate body just under the cap".
             try:
                 try:
-                    payload = upstream.read()
+                    payload = upstream.read(self.MAX_BODY_BYTES + 1)
                 finally:
                     upstream.close()
             except (OSError, http.client.HTTPException) as exc:
                 log.warning("upstream read error: %s", exc)
                 self.send_error(502, "Bad Gateway")
+                return
+            if len(payload) > self.MAX_BODY_BYTES:
+                log.warning(
+                    "upstream response exceeded %d bytes; returning 502",
+                    self.MAX_BODY_BYTES,
+                )
+                self.send_error(502, "upstream response too large")
                 return
 
             # Forward upstream's status + headers. We leave upstream's
