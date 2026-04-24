@@ -34,7 +34,7 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterable
+from typing import AbstractSet, Iterable
 
 import jwt
 import requests
@@ -210,7 +210,9 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
     return False
 
 
-def _strip_headers(headers: Iterable[tuple[str, str]], drop: set[str]) -> list[tuple[str, str]]:
+def _strip_headers(
+    headers: Iterable[tuple[str, str]], drop: AbstractSet[str]
+) -> list[tuple[str, str]]:
     drop_lower = {h.lower() for h in drop}
     return [(k, v) for k, v in headers if k.lower() not in drop_lower]
 
@@ -362,6 +364,10 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 self.send_header(key, value)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
+            # HEAD responses MUST NOT include a message body (RFC 9110 §9.3.2).
+            # Send the same Content-Length the real GET would but no bytes.
+            if self.command == "HEAD":
+                return
             try:
                 self.wfile.write(payload)
             except (BrokenPipeError, ConnectionResetError):
