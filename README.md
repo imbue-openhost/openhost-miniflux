@@ -52,6 +52,6 @@ Needs ~512 MB RAM (Miniflux ~30 MB + PostgreSQL ~100-200 MB + sidecar ~30 MB + h
 ## Files
 
 - `Dockerfile` — multi-stage build: extracts Miniflux binary, adds PostgreSQL and a Python venv with `PyJWT[crypto]` + `requests` on Alpine.
-- `start.sh` — initializes PostgreSQL, configures Miniflux via env vars, launches Miniflux on loopback, then execs the auth-proxy sidecar.
+- `start.sh` — initializes PostgreSQL, configures Miniflux via env vars, starts Miniflux on loopback, then starts the auth-proxy sidecar; supervises both so the container exits (and is restarted by OpenHost) if either child dies.
 - `auth_proxy.py` — the JWT-verifying reverse proxy that translates OpenHost SSO into Miniflux's auth-proxy header.
 - `openhost.toml` — OpenHost app manifest. Only `/healthcheck` is marked as a public path.

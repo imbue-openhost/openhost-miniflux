@@ -83,13 +83,21 @@ class JwksCache:
         self._router_url = router_url.rstrip("/")
         self._keys: list = []
         self._fetched_at: float = 0.0
-        self._lock = threading.Lock()
+        # `_cache_lock` guards reads/writes of _keys and _fetched_at. It is
+        # only ever held briefly — never across the blocking HTTP fetch.
+        self._cache_lock = threading.Lock()
+        # `_fetch_lock` serialises the HTTP fetch itself so only one thread
+        # at a time calls the router while others keep serving cached keys.
+        self._fetch_lock = threading.Lock()
 
     def _fetch(self) -> list:
         url = f"{self._router_url}{JWKS_PATH}"
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        jwks = resp.json()
+        # Use a context manager so the underlying connection is released on
+        # every exit path (success, HTTPError from raise_for_status, JSON
+        # decode error, etc.).
+        with requests.get(url, timeout=5) as resp:
+            resp.raise_for_status()
+            jwks = resp.json()
         keys = []
         for jwk in jwks.get("keys", []):
             # PyJWT expects an algorithms object; derive from the JWK.
@@ -100,23 +108,41 @@ class JwksCache:
         return keys
 
     def get(self) -> list:
-        with self._lock:
-            if self._keys and (time.time() - self._fetched_at) < JWKS_REFRESH_INTERVAL_SEC:
-                return self._keys
+        # Fast path: return cached keys without touching either lock beyond
+        # the brief snapshot read.
+        with self._cache_lock:
+            cached_keys = self._keys
+            cached_at = self._fetched_at
+        if cached_keys and (time.time() - cached_at) < JWKS_REFRESH_INTERVAL_SEC:
+            return cached_keys
+
+        # Serialise refreshes across threads so we only fetch once even under
+        # concurrent bursts. Other threads block only on this lock, not on
+        # the network I/O directly.
+        with self._fetch_lock:
+            # Another thread may have refreshed while we waited.
+            with self._cache_lock:
+                cached_keys = self._keys
+                cached_at = self._fetched_at
+            if cached_keys and (time.time() - cached_at) < JWKS_REFRESH_INTERVAL_SEC:
+                return cached_keys
+
             try:
                 keys = self._fetch()
-                self._keys = keys
-                self._fetched_at = time.time()
-                log.info("refreshed JWKS (%d key(s))", len(keys))
-            except Exception as exc:  # noqa: BLE001 - we want to log+fallback
-                if self._keys:
+            except Exception as exc:  # noqa: BLE001 - log+fallback
+                if cached_keys:
                     log.warning(
                         "JWKS refresh failed, using cached keys: %s", exc
                     )
-                else:
-                    log.warning("JWKS fetch failed and no cache: %s", exc)
-                    raise
-            return self._keys
+                    return cached_keys
+                log.warning("JWKS fetch failed and no cache: %s", exc)
+                raise
+
+            with self._cache_lock:
+                self._keys = keys
+                self._fetched_at = time.time()
+            log.info("refreshed JWKS (%d key(s))", len(keys))
+            return keys
 
     def prefetch(self) -> None:
         try:
@@ -128,9 +154,15 @@ class JwksCache:
 def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
     """Parse an RFC6265 Cookie header into a {name: value} dict.
 
-    Purposefully lenient: cookies with malformed encoding are stored as-is;
-    JWT values only contain URL-safe base64 characters + two dots so decoding
-    is a no-op in practice.
+    Uses first-value-wins semantics for duplicate cookie names. Browsers
+    send most-specific-path / most-specific-domain cookies first, so the
+    first occurrence is what the site "meant" to set. This also prevents a
+    trivial denial-of-service where a hostile client appends a duplicate
+    `zone_auth=garbage` after the real cookie to make us reject an
+    otherwise valid owner token.
+
+    Purposefully lenient on encoding: JWT values only contain URL-safe
+    base64 characters + two dots so decoding is a no-op in practice.
     """
     if not cookie_header:
         return {}
@@ -139,7 +171,7 @@ def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
         if "=" not in part:
             continue
         name, value = part.split("=", 1)
-        result[name.strip()] = value.strip()
+        result.setdefault(name.strip(), value.strip())
     return result
 
 
@@ -223,9 +255,29 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     # few MiB). Requests larger than this get a 413.
     MAX_BODY_BYTES = 32 * 1024 * 1024
 
+    # Read timeout on the client socket. A slow-loris client dripping body
+    # bytes over minutes would otherwise tie up a server thread indefinitely,
+    # leading to thread exhaustion under concurrency.
+    CLIENT_READ_TIMEOUT_SECONDS = 60
+
     def _proxy(self) -> None:
-        # Always drop any client-supplied auth header so it cannot be spoofed.
-        cleaned_headers = _strip_headers(self.headers.items(), {AUTH_HEADER_NAME})
+        # Apply a read timeout to the incoming socket so a slow client can't
+        # hold a thread forever while sending the request body.
+        try:
+            self.connection.settimeout(self.CLIENT_READ_TIMEOUT_SECONDS)
+        except OSError:
+            # Very unlikely (socket already closed); nothing to recover.
+            pass
+
+        # Strip (a) the auth header (never trust client-supplied) and (b)
+        # hop-by-hop headers (Connection, Transfer-Encoding, etc.) so the
+        # upstream request is semantically clean. We rebuild the body into a
+        # buffered Content-Length request below, so forwarding the client's
+        # Content-Length / Transfer-Encoding would be wrong.
+        cleaned_headers = _strip_headers(
+            self.headers.items(),
+            HOP_BY_HOP_HEADERS | {AUTH_HEADER_NAME.lower()},
+        )
 
         # Decide whether this request carries an owner's signed cookie.
         cookies = _parse_cookie_header(self.headers.get("Cookie"))
@@ -264,20 +316,34 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             # this doesn't desync a pipeline.
             body = self.rfile.read(self.MAX_BODY_BYTES)
 
-        # Single try/finally around the whole upstream interaction guarantees
-        # the socket is released on every exit path (including getresponse
-        # errors, which earlier versions of this code leaked).
+        # The outer try/finally guarantees the upstream socket is always
+        # released, even if conn.request() or getresponse() raises. We use
+        # putrequest/putheader rather than conn.request() so that duplicate
+        # header names (e.g. multiple Set-Cookie on the request direction or
+        # chained X-Forwarded-For entries) are each preserved — conn.request()
+        # takes a dict and would silently collapse duplicates to the last
+        # value.
         conn = http.client.HTTPConnection(
             self.miniflux_host, self.miniflux_port, timeout=60
         )
         try:
             try:
-                conn.request(
+                # Let http.client set its own Host header to `127.0.0.1:8081`;
+                # Miniflux generates absolute URLs from its $BASE_URL env var
+                # (set by start.sh from $OPENHOST_ZONE_DOMAIN) and doesn't
+                # rely on Host for that. `skip_accept_encoding` avoids
+                # http.client adding `Accept-Encoding: identity` if the
+                # client omitted the header.
+                conn.putrequest(
                     self.command,
                     self.path,
-                    body=body,
-                    headers=dict(cleaned_headers),
+                    skip_accept_encoding=True,
                 )
+                for key, value in cleaned_headers:
+                    conn.putheader(key, value)
+                if body is not None:
+                    conn.putheader("Content-Length", str(len(body)))
+                conn.endheaders(message_body=body)
                 upstream = conn.getresponse()
             except (OSError, http.client.HTTPException) as exc:
                 log.warning("upstream error: %s", exc)
@@ -305,12 +371,29 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             conn.close()
 
 
-class DualStackServer(ThreadingHTTPServer):
-    # Listen on IPv4; OpenHost's router talks to the container by IPv4 via
-    # Docker's bridge. Allow quick restarts.
+class IPv4ThreadingServer(ThreadingHTTPServer):
+    # OpenHost's router talks to the container over Docker's bridge network
+    # on IPv4, so we explicitly bind IPv4 and don't advertise dual-stack
+    # capability. allow_reuse_address lets us come back up quickly after a
+    # crash, daemon_threads ensures request threads don't keep the process
+    # alive on shutdown.
     address_family = socket.AF_INET
     allow_reuse_address = True
     daemon_threads = True
+
+
+def _port_from_env(name: str, default: int) -> int:
+    """Read a port from an env var, with a clear error on non-integer input."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name}={raw!r} is not an integer: {exc}") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name}={raw!r} is out of range (1-65535)")
+    return port
 
 
 def main() -> int:
@@ -319,8 +402,12 @@ def main() -> int:
         log.error("OPENHOST_ROUTER_URL is not set; refusing to start")
         return 1
 
-    listen_port = int(os.environ.get("AUTH_PROXY_LISTEN_PORT", "8080"))
-    miniflux_port = int(os.environ.get("MINIFLUX_UPSTREAM_PORT", "8081"))
+    try:
+        listen_port = _port_from_env("AUTH_PROXY_LISTEN_PORT", 8080)
+        miniflux_port = _port_from_env("MINIFLUX_UPSTREAM_PORT", 8081)
+    except ValueError as exc:
+        log.error("invalid port configuration: %s", exc)
+        return 1
 
     jwks = JwksCache(router_url)
     jwks.prefetch()
@@ -328,7 +415,7 @@ def main() -> int:
     AuthProxyHandler.jwks = jwks
     AuthProxyHandler.miniflux_port = miniflux_port
 
-    server = DualStackServer(("0.0.0.0", listen_port), AuthProxyHandler)
+    server = IPv4ThreadingServer(("0.0.0.0", listen_port), AuthProxyHandler)
     log.info(
         "listening on 0.0.0.0:%d -> 127.0.0.1:%d (router=%s)",
         listen_port,

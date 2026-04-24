@@ -140,11 +140,20 @@ PROXY_PID=$!
 trap 'kill -TERM "$MINIFLUX_PID" "$PROXY_PID" 2>/dev/null; wait' TERM INT
 
 # Block until either child exits, then tear down the survivor and exit with
-# the first child's status. `wait -n` (bash/dash/busybox ash all support it)
-# returns as soon as any backgrounded job finishes.
+# the first child's status. `wait -n` is a bash builtin (not available in
+# POSIX sh / busybox ash) and returns as soon as any backgrounded job exits.
+#
+# We explicitly disable `set -e` around the `wait -n` call: with errexit on,
+# a child that exits non-zero (or a trap interrupting the wait) would cause
+# the shell to exit immediately before the explicit teardown (`kill` +
+# `wait`) runs, leaving the surviving process orphaned.
+set +e
 wait -n "$MINIFLUX_PID" "$PROXY_PID"
 EXIT_CODE=$?
+set -e
 echo "[start.sh] Child exited (code=$EXIT_CODE); stopping container"
 kill -TERM "$MINIFLUX_PID" "$PROXY_PID" 2>/dev/null || true
-wait
+# Allow remaining processes to drain; don't let `set -e` abort if they too
+# exit non-zero.
+wait || true
 exit "$EXIT_CODE"
