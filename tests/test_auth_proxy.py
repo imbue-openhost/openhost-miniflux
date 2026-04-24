@@ -333,11 +333,24 @@ def test_jwks_fetch_raises_when_all_entries_malformed(monkeypatch):
 
 
 def test_jwks_prefetch_swallows_errors(monkeypatch, caplog):
+    """prefetch() is called at startup to warm the cache; a failing router
+    must not prevent the server from coming up. Confirm both (a) the
+    exception is swallowed and (b) the failure is logged so an operator
+    has a breadcrumb."""
+    import logging
+
     cache = auth_proxy.JwksCache("http://router.invalid")
 
     def _raise() -> list:
         raise RuntimeError("nope")
 
     monkeypatch.setattr(cache, "_fetch", _raise)
-    # Should NOT raise; just log a warning.
-    cache.prefetch()
+    with caplog.at_level(logging.WARNING, logger="auth_proxy"):
+        cache.prefetch()  # must not raise
+
+    # The failure must be visible in the logs. We don't assert the exact
+    # message format (that's an implementation detail) — just that _some_
+    # warning mentioning the failure was emitted.
+    assert any("prefetch" in rec.message.lower() for rec in caplog.records), (
+        "prefetch() failure must be logged"
+    )

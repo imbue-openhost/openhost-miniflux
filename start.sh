@@ -155,6 +155,13 @@ trap 'kill -TERM "$MINIFLUX_PID" "$PROXY_PID" 2>/dev/null; wait' TERM INT
 # a child that exits non-zero (or a trap interrupting the wait) would cause
 # the shell to exit immediately before the explicit teardown (`kill` +
 # `wait`) runs, leaving the surviving process orphaned.
+#
+# Note on SIGTERM shutdowns: if Docker/OpenHost sends SIGTERM to this shell
+# while `wait -n` is blocking, the TERM trap fires, kills both children,
+# calls `wait`, and control returns to `wait -n` which then exits 128+15=143.
+# That's the correct Unix convention for a signal-terminated process and
+# is what OpenHost expects for a graceful stop — we intentionally do not
+# attempt to substitute a child's original exit code.
 set +e
 wait -n "$MINIFLUX_PID" "$PROXY_PID"
 EXIT_CODE=$?

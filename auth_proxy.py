@@ -438,8 +438,8 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 self._safe_send_error(502, "Bad Gateway")
                 try:
                     upstream.close()
-                except Exception:  # noqa: BLE001 - best effort only
-                    pass
+                except Exception as close_exc:  # noqa: BLE001 - best effort
+                    log.debug("upstream.close() after read error raised: %s", close_exc)
                 return
             try:
                 upstream.close()
