@@ -3,6 +3,7 @@ FROM miniflux/miniflux:latest AS miniflux
 FROM alpine:3.20
 
 RUN apk add --no-cache \
+    bash \
     postgresql16 \
     postgresql16-client \
     postgresql16-contrib \

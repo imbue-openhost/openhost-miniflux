@@ -9,10 +9,11 @@ port = 8080
 
 [routing]
 health_check = "/healthcheck"
-# Only the health-check endpoint is unauthenticated so the OpenHost router
-# can probe liveness. Every other path goes through the container's
-# auth-proxy sidecar which enforces the zone_auth cookie -- so even inside
-# the container Miniflux itself is reachable only after SSO succeeds.
+# Only the health-check endpoint is exposed unauthenticated so the OpenHost
+# router can probe liveness. Every other path goes through the container's
+# auth-proxy sidecar which enforces the zone_auth cookie before forwarding
+# to Miniflux. Miniflux itself listens on loopback inside the container so
+# traffic from outside the container cannot bypass the sidecar.
 public_paths = ["/healthcheck"]
 
 [resources]

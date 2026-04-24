@@ -1,4 +1,7 @@
-#!/bin/sh
+#!/bin/bash
+# `bash` (not `sh`) is required: we rely on `wait -n` to block until the
+# first of two backgrounded processes exits so we can tear down the other
+# one cleanly. Alpine's /bin/sh (busybox ash) does not support `wait -n`.
 set -e
 
 PERSIST="${OPENHOST_APP_DATA_DIR:-/data}"
@@ -54,11 +57,9 @@ if ! su postgres -c "psql -h /run/postgresql -tAc \"SELECT 1 FROM pg_database WH
     su postgres -c "psql -h /run/postgresql -d miniflux -c 'CREATE EXTENSION IF NOT EXISTS hstore'"
 fi
 
-# ---------------------------------------------------------------------------
-# One-time cleanup: remove the now-unused admin password file left behind
-# by previous versions of this app.  The zone owner authenticates via
-# OpenHost SSO now; there is no local password to stash.
-# ---------------------------------------------------------------------------
+# Remove the legacy admin password file. Authentication is handled by the
+# OpenHost zone's SSO; this file is never written by current code and is
+# cleared here so it cannot be mistaken for a live credential.
 rm -f "$PERSIST/.admin_password"
 
 # ---------------------------------------------------------------------------
@@ -69,8 +70,12 @@ export RUN_MIGRATIONS=1
 
 # Miniflux listens on loopback only. The auth-proxy sidecar (see
 # auth_proxy.py) fronts it on :8080 and is the only component allowed to
-# assert OpenHost identity via the trusted proxy header.
-export LISTEN_ADDR=127.0.0.1:8081
+# assert OpenHost identity via the trusted proxy header. The sidecar reads
+# the same MINIFLUX_UPSTREAM_PORT env var so the two stay in sync if the
+# default is ever overridden by an operator.
+MINIFLUX_UPSTREAM_PORT="${MINIFLUX_UPSTREAM_PORT:-8081}"
+export MINIFLUX_UPSTREAM_PORT
+export LISTEN_ADDR="127.0.0.1:${MINIFLUX_UPSTREAM_PORT}"
 
 # Proxy auth: Miniflux trusts the X-Openhost-User header but only when the
 # request arrives from 127.0.0.1 (the sidecar). Accept user auto-creation so
@@ -104,10 +109,12 @@ if [ -n "$OPENHOST_ZONE_DOMAIN" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Launch miniflux in the background, then the auth-proxy sidecar in the
-# foreground. If either exits, kill both so OpenHost restarts the container.
+# Launch both processes under the shell so we can supervise them together.
+# The shell stays PID 1, catches SIGTERM from Docker/OpenHost, forwards it
+# to both children, and reaps them. If either child exits the whole
+# container exits too so OpenHost can restart it.
 # ---------------------------------------------------------------------------
-echo "[start.sh] Starting miniflux on 127.0.0.1:8081"
+echo "[start.sh] Starting miniflux on 127.0.0.1:${MINIFLUX_UPSTREAM_PORT}"
 /usr/bin/miniflux &
 MINIFLUX_PID=$!
 
@@ -115,7 +122,11 @@ MINIFLUX_PID=$!
 # accepting requests. Not strictly required (the sidecar returns 502 until
 # miniflux is up), but avoids a noisy first-request failure.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0) if not s.connect_ex(("127.0.0.1", 8081)) else sys.exit(1)' 2>/dev/null; then
+    if MFX_PORT="$MINIFLUX_UPSTREAM_PORT" python3 -c 'import os,socket,sys
+p = int(os.environ["MFX_PORT"])
+s = socket.socket()
+s.settimeout(0.5)
+sys.exit(0 if s.connect_ex(("127.0.0.1", p)) == 0 else 1)' 2>/dev/null; then
         break
     fi
     sleep 0.5
@@ -127,7 +138,37 @@ if ! kill -0 "$MINIFLUX_PID" 2>/dev/null; then
     exit $?
 fi
 
-trap 'kill -TERM "$MINIFLUX_PID" 2>/dev/null; wait' TERM INT
-
 echo "[start.sh] Starting auth-proxy on 0.0.0.0:8080"
-exec /opt/auth-venv/bin/python3 /app/auth_proxy.py
+/opt/auth-venv/bin/python3 /app/auth_proxy.py &
+PROXY_PID=$!
+
+# Forward SIGTERM / SIGINT to both children so the container stops cleanly.
+# Note: `exec` would have discarded this trap, so we keep the shell alive as
+# PID 1 and use `wait -n` to block until one of the two processes exits.
+trap 'kill -TERM "$MINIFLUX_PID" "$PROXY_PID" 2>/dev/null; wait' TERM INT
+
+# Block until either child exits, then tear down the survivor and exit with
+# the first child's status. `wait -n` is a bash builtin (not available in
+# POSIX sh / busybox ash) and returns as soon as any backgrounded job exits.
+#
+# We explicitly disable `set -e` around the `wait -n` call: with errexit on,
+# a child that exits non-zero (or a trap interrupting the wait) would cause
+# the shell to exit immediately before the explicit teardown (`kill` +
+# `wait`) runs, leaving the surviving process orphaned.
+#
+# Note on SIGTERM shutdowns: if Docker/OpenHost sends SIGTERM to this shell
+# while `wait -n` is blocking, the TERM trap fires, kills both children,
+# calls `wait`, and control returns to `wait -n` which then exits 128+15=143.
+# That's the correct Unix convention for a signal-terminated process and
+# is what OpenHost expects for a graceful stop — we intentionally do not
+# attempt to substitute a child's original exit code.
+set +e
+wait -n "$MINIFLUX_PID" "$PROXY_PID"
+EXIT_CODE=$?
+set -e
+echo "[start.sh] Child exited (code=$EXIT_CODE); stopping container"
+kill -TERM "$MINIFLUX_PID" "$PROXY_PID" 2>/dev/null || true
+# Allow remaining processes to drain; don't let `set -e` abort if they too
+# exit non-zero.
+wait || true
+exit "$EXIT_CODE"
