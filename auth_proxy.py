@@ -32,7 +32,6 @@ import socket
 import sys
 import threading
 import time
-import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import AbstractSet, Iterable
 
@@ -58,8 +57,6 @@ HOP_BY_HOP_HEADERS = frozenset(
         "Upgrade",
         # Host is rewritten by the http.client layer based on the target.
         "Host",
-        # We rewrite these to reflect our own connection.
-        "Content-Length",
     )
 )
 
@@ -188,7 +185,11 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
         return False
 
     # Try each key; RS256 verification, require exp claim, no audience check
-    # (the router doesn't set aud). If any key verifies, accept.
+    # (the router doesn't set aud). If any key verifies and the subject is
+    # "owner", accept. We continue the loop on both invalid-signature errors
+    # and successful-but-non-owner decodes so a JWKS rollover (old key still
+    # present while the new one takes over) can't accidentally stop
+    # accepting legitimate owner tokens.
     for key in keys:
         try:
             claims = jwt.decode(
@@ -204,9 +205,6 @@ def _verify_owner(token: str, jwks: JwksCache) -> bool:
             continue
         if claims.get("sub") == "owner":
             return True
-        # A valid but non-owner token (e.g. future guest tokens) - treat as
-        # unauthenticated for our purposes.
-        return False
     return False
 
 
@@ -271,14 +269,16 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             # Very unlikely (socket already closed); nothing to recover.
             pass
 
-        # Strip (a) the auth header (never trust client-supplied) and (b)
-        # hop-by-hop headers (Connection, Transfer-Encoding, etc.) so the
-        # upstream request is semantically clean. We rebuild the body into a
-        # buffered Content-Length request below, so forwarding the client's
-        # Content-Length / Transfer-Encoding would be wrong.
+
+        # Strip (a) the auth header (never trust client-supplied), (b)
+        # hop-by-hop headers (Connection, Transfer-Encoding, etc.), and (c)
+        # Content-Length — we rebuild the body into a buffered request below
+        # and set a fresh Content-Length from the actual bytes we send.
+        # Forwarding the client's Content-Length or Transfer-Encoding would
+        # confuse the upstream when the two disagree.
         cleaned_headers = _strip_headers(
             self.headers.items(),
-            HOP_BY_HOP_HEADERS | {AUTH_HEADER_NAME.lower()},
+            HOP_BY_HOP_HEADERS | {AUTH_HEADER_NAME.lower(), "content-length"},
         )
 
         # Decide whether this request carries an owner's signed cookie.
@@ -352,20 +352,36 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(502, "Bad Gateway")
                 return
 
+            # Read the upstream body into memory. We have to buffer anyway
+            # because we rewrite Content-Length, and streaming would mean
+            # handling Transfer-Encoding: chunked end-to-end. A read failure
+            # here gets the same treatment as a failure during the request
+            # phase: log and return 502 if we haven't written headers yet.
             try:
-                payload = upstream.read()
-            finally:
-                upstream.close()
+                try:
+                    payload = upstream.read()
+                finally:
+                    upstream.close()
+            except (OSError, http.client.HTTPException) as exc:
+                log.warning("upstream read error: %s", exc)
+                self.send_error(502, "Bad Gateway")
+                return
 
+            # Forward upstream's status + headers. We leave upstream's
+            # Content-Length intact because for HEAD it's the only way the
+            # client learns the size a real GET would return; for everything
+            # else it matches len(payload) anyway since we just read the
+            # whole body.
             self.send_response(upstream.status, upstream.reason)
             for key, value in upstream.getheaders():
                 if key.lower() in HOP_BY_HOP_HEADERS:
                     continue
                 self.send_header(key, value)
-            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
+
             # HEAD responses MUST NOT include a message body (RFC 9110 §9.3.2).
-            # Send the same Content-Length the real GET would but no bytes.
+            # http.client already returns an empty payload for HEAD but
+            # suppress the write unconditionally for clarity.
             if self.command == "HEAD":
                 return
             try:
