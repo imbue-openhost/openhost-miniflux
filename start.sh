@@ -44,8 +44,17 @@ chown -R postgres:postgres "$PG_DATA"
 # Clean up stale PID from unclean shutdown
 rm -f "$PG_DATA/postmaster.pid"
 
-# Start PostgreSQL
-su postgres -c "pg_ctl start -D '$PG_DATA' -l '$PERSIST/postgresql.log' -w -o '-k /run/postgresql'"
+# Start PostgreSQL.
+#
+# The log file lives inside $PG_DATA (not the top-level $PERSIST) because
+# $PG_DATA is always chowned to postgres:postgres, whereas $PERSIST is the
+# OpenHost-mounted app_data dir whose in-container ownership depends on
+# the host container runtime (Docker preserves root-as-root, Podman
+# rootless remaps via userns) — putting the log there caused
+# `/bin/sh: can't create .../postgresql.log: Permission denied` when
+# pg_ctl tried to open the log file as the postgres user under Podman.
+PG_LOG="$PG_DATA/postgresql.log"
+su postgres -c "pg_ctl start -D '$PG_DATA' -l '$PG_LOG' -w -o '-k /run/postgresql'"
 
 # ---------------------------------------------------------------------------
 # Create miniflux database on first boot
@@ -61,6 +70,13 @@ fi
 # OpenHost zone's SSO; this file is never written by current code and is
 # cleared here so it cannot be mistaken for a live credential.
 rm -f "$PERSIST/.admin_password"
+
+# Remove a legacy postgresql.log at the top-level app_data path. The log
+# now lives inside $PG_DATA. We attempt the removal but ignore errors — on
+# Podman-rootless the caller may not have permission to unlink a file in
+# a directory whose ownership is remapped, and the file being present is
+# harmless once we stop writing to it.
+rm -f "$PERSIST/postgresql.log" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Miniflux configuration
