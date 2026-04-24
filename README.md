@@ -33,8 +33,7 @@ The app will be available at `miniflux.{zone_domain}`. Browse to it and you're s
 ## Data
 
 All persistent data lives in `$OPENHOST_APP_DATA_DIR/`:
-- `pgdata/` — PostgreSQL data directory (feeds, articles, user settings)
-- `postgresql.log` — PostgreSQL log file
+- `pgdata/` — PostgreSQL data directory (feeds, articles, user settings, plus `postgresql.log`)
 
 ## API access
 
