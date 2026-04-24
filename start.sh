@@ -70,8 +70,12 @@ export RUN_MIGRATIONS=1
 
 # Miniflux listens on loopback only. The auth-proxy sidecar (see
 # auth_proxy.py) fronts it on :8080 and is the only component allowed to
-# assert OpenHost identity via the trusted proxy header.
-export LISTEN_ADDR=127.0.0.1:8081
+# assert OpenHost identity via the trusted proxy header. The sidecar reads
+# the same MINIFLUX_UPSTREAM_PORT env var so the two stay in sync if the
+# default is ever overridden by an operator.
+MINIFLUX_UPSTREAM_PORT="${MINIFLUX_UPSTREAM_PORT:-8081}"
+export MINIFLUX_UPSTREAM_PORT
+export LISTEN_ADDR="127.0.0.1:${MINIFLUX_UPSTREAM_PORT}"
 
 # Proxy auth: Miniflux trusts the X-Openhost-User header but only when the
 # request arrives from 127.0.0.1 (the sidecar). Accept user auto-creation so
@@ -110,7 +114,7 @@ fi
 # to both children, and reaps them. If either child exits the whole
 # container exits too so OpenHost can restart it.
 # ---------------------------------------------------------------------------
-echo "[start.sh] Starting miniflux on 127.0.0.1:8081"
+echo "[start.sh] Starting miniflux on 127.0.0.1:${MINIFLUX_UPSTREAM_PORT}"
 /usr/bin/miniflux &
 MINIFLUX_PID=$!
 
@@ -118,7 +122,11 @@ MINIFLUX_PID=$!
 # accepting requests. Not strictly required (the sidecar returns 502 until
 # miniflux is up), but avoids a noisy first-request failure.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0) if not s.connect_ex(("127.0.0.1", 8081)) else sys.exit(1)' 2>/dev/null; then
+    if MFX_PORT="$MINIFLUX_UPSTREAM_PORT" python3 -c 'import os,socket,sys
+p = int(os.environ["MFX_PORT"])
+s = socket.socket()
+s.settimeout(0.5)
+sys.exit(0 if s.connect_ex(("127.0.0.1", p)) == 0 else 1)' 2>/dev/null; then
         break
     fi
     sleep 0.5

@@ -96,12 +96,25 @@ class JwksCache:
             resp.raise_for_status()
             jwks = resp.json()
         keys = []
+        skipped = 0
         for jwk in jwks.get("keys", []):
-            # PyJWT expects an algorithms object; derive from the JWK.
-            key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
+            # Parse each JWK individually. If the router ever publishes a
+            # key type we don't handle (e.g. an EC key alongside RSA during
+            # a future rotation), or a key with a missing field, we log and
+            # skip that one entry rather than discarding the whole set and
+            # locking the owner out.
+            try:
+                key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
+            except Exception as exc:  # noqa: BLE001
+                skipped += 1
+                kid = jwk.get("kid") if isinstance(jwk, dict) else None
+                log.warning("skipping malformed JWK (kid=%s): %s", kid, exc)
+                continue
             keys.append(key)
         if not keys:
-            raise RuntimeError("router JWKS contains no keys")
+            raise RuntimeError(
+                f"router JWKS contains no usable keys (skipped {skipped})"
+            )
         return keys
 
     def get(self) -> list:
@@ -266,6 +279,18 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     # leading to thread exhaustion under concurrency.
     CLIENT_READ_TIMEOUT_SECONDS = 60
 
+    def _safe_send_error(self, code: int, message: str) -> None:
+        """Send an HTTP error, silently swallowing OSError.
+
+        If the client has already disconnected, send_error will fail with
+        BrokenPipeError (an OSError subclass). We don't want that to bubble
+        up as an unhandled exception — the request is already over.
+        """
+        try:
+            self.send_error(code, message)
+        except OSError as exc:
+            log.debug("client disconnected before error response: %s", exc)
+
     def _proxy(self) -> None:
         # Apply a read timeout to the incoming socket so a slow client can't
         # hold a thread forever while sending the request body.
@@ -293,7 +318,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         # a None deref crash the handler.
         if self.jwks is None:
             log.error("auth-proxy JWKS not initialised; refusing request")
-            self.send_error(503, "auth-proxy not initialised")
+            self._safe_send_error(503, "auth-proxy not initialised")
             return
         cookies = _parse_cookie_header(self.headers.get("Cookie"))
         token = cookies.get(ZONE_COOKIE, "")
@@ -312,7 +337,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
         # and which would send a client into a retry loop).
         transfer_encoding = self.headers.get("Transfer-Encoding", "").lower().strip()
         if transfer_encoding and transfer_encoding != "identity":
-            self.send_error(501, "Transfer-Encoding not supported")
+            self._safe_send_error(501, "Transfer-Encoding not supported")
             return
 
         body: bytes | None = None
@@ -321,15 +346,15 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             try:
                 length = int(content_length_header)
             except ValueError:
-                self.send_error(400, "invalid Content-Length")
+                self._safe_send_error(400, "invalid Content-Length")
                 return
             if length < 0:
-                self.send_error(400, "negative Content-Length")
+                self._safe_send_error(400, "negative Content-Length")
                 return
             if length > self.MAX_BODY_BYTES:
                 # Reject before allocating. Without this cap a hostile client
                 # could advertise a multi-GiB body and exhaust container RAM.
-                self.send_error(413, "request body too large")
+                self._safe_send_error(413, "request body too large")
                 return
             if length > 0:
                 try:
@@ -340,11 +365,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     # the client sees a clean response instead of a raw
                     # traceback in the server log.
                     log.info("client read error: %s", exc)
-                    try:
-                        self.send_error(400, "request body read failed")
-                    except OSError:
-                        # Client is already gone; nothing left to say.
-                        pass
+                    self._safe_send_error(400, "request body read failed")
                     return
                 if len(body) != length:
                     # Short read: the client closed the socket before
@@ -357,10 +378,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                         length,
                         len(body),
                     )
-                    try:
-                        self.send_error(400, "incomplete request body")
-                    except OSError:
-                        pass
+                    self._safe_send_error(400, "incomplete request body")
                     return
             else:
                 body = b""
@@ -404,7 +422,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 upstream = conn.getresponse()
             except (OSError, http.client.HTTPException) as exc:
                 log.warning("upstream error: %s", exc)
-                self.send_error(502, "Bad Gateway")
+                self._safe_send_error(502, "Bad Gateway")
                 return
 
             # Read the upstream body into memory, capped at the same limit
@@ -420,40 +438,40 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                     upstream.close()
             except (OSError, http.client.HTTPException) as exc:
                 log.warning("upstream read error: %s", exc)
-                self.send_error(502, "Bad Gateway")
+                self._safe_send_error(502, "Bad Gateway")
                 return
             if len(payload) > self.MAX_BODY_BYTES:
                 log.warning(
                     "upstream response exceeded %d bytes; returning 502",
                     self.MAX_BODY_BYTES,
                 )
-                self.send_error(502, "upstream response too large")
+                self._safe_send_error(502, "upstream response too large")
                 return
 
             # Forward upstream's status + headers. We leave upstream's
             # Content-Length intact because for HEAD it's the only way the
             # client learns the size a real GET would return; for everything
             # else it matches len(payload) anyway since we just read the
-            # whole body.
-            self.send_response(upstream.status, upstream.reason)
-            for key, value in upstream.getheaders():
-                if key.lower() in HOP_BY_HOP_HEADERS:
-                    continue
-                self.send_header(key, value)
-            self.end_headers()
-
-            # HEAD responses MUST NOT include a message body (RFC 9110 §9.3.2).
-            # http.client already returns an empty payload for HEAD but
-            # suppress the write unconditionally for clarity.
-            if self.command == "HEAD":
-                return
+            # whole body. The whole block writes to the client socket, so a
+            # disconnect here surfaces as OSError; swallow it the same way
+            # we do for the body write below.
             try:
-                self.wfile.write(payload)
+                self.send_response(upstream.status, upstream.reason)
+                for key, value in upstream.getheaders():
+                    if key.lower() in HOP_BY_HOP_HEADERS:
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                # HEAD responses MUST NOT include a message body (RFC 9110
+                # §9.3.2). http.client already returns an empty payload for
+                # HEAD but suppress the write unconditionally for clarity.
+                if self.command != "HEAD":
+                    self.wfile.write(payload)
             except OSError as exc:
                 # BrokenPipeError, ConnectionResetError, TimeoutError, and
-                # ECONNABORTED are all signals that the client went away
-                # mid-response. Nothing we can do except log at debug and
-                # avoid crashing the handler thread.
+                # ECONNABORTED are all signals that the client went away.
+                # Nothing we can do except log at debug and avoid crashing
+                # the handler thread.
                 log.debug("client disconnected mid-response: %s", exc)
         finally:
             conn.close()
