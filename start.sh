@@ -3,7 +3,6 @@ set -e
 
 PERSIST="${OPENHOST_APP_DATA_DIR:-/data}"
 PG_DATA="$PERSIST/pgdata"
-ADMIN_PASS_FILE="$PERSIST/.admin_password"
 
 mkdir -p "$PERSIST"
 
@@ -56,32 +55,36 @@ if ! su postgres -c "psql -h /run/postgresql -tAc \"SELECT 1 FROM pg_database WH
 fi
 
 # ---------------------------------------------------------------------------
-# Generate and persist admin password
+# One-time cleanup: remove the now-unused admin password file left behind
+# by previous versions of this app.  The zone owner authenticates via
+# OpenHost SSO now; there is no local password to stash.
 # ---------------------------------------------------------------------------
-if [ ! -f "$ADMIN_PASS_FILE" ]; then
-    ADMIN_PASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n/+=' | head -c 24)
-    echo -n "$ADMIN_PASS" > "$ADMIN_PASS_FILE"
-    chmod 600 "$ADMIN_PASS_FILE"
-fi
-ADMIN_PASS=$(cat "$ADMIN_PASS_FILE")
-
-echo "======================================"
-echo "Miniflux admin user:     admin"
-echo "Miniflux admin password: $ADMIN_PASS"
-echo "======================================"
+rm -f "$PERSIST/.admin_password"
 
 # ---------------------------------------------------------------------------
 # Miniflux configuration
 # ---------------------------------------------------------------------------
 export DATABASE_URL="user=miniflux dbname=miniflux sslmode=disable host=/run/postgresql"
 export RUN_MIGRATIONS=1
-export CREATE_ADMIN=1
-export ADMIN_USERNAME=admin
-export ADMIN_PASSWORD="$ADMIN_PASS"
-export LISTEN_ADDR=0.0.0.0:8080
+
+# Miniflux listens on loopback only. The auth-proxy sidecar (see
+# auth_proxy.py) fronts it on :8080 and is the only component allowed to
+# assert OpenHost identity via the trusted proxy header.
+export LISTEN_ADDR=127.0.0.1:8081
+
+# Proxy auth: Miniflux trusts the X-Openhost-User header but only when the
+# request arrives from 127.0.0.1 (the sidecar). Accept user auto-creation so
+# the `admin` miniflux user gets minted on the first owner login; disable the
+# local username/password form entirely so no one can bypass SSO.
+export AUTH_PROXY_HEADER=X-Openhost-User
+export AUTH_PROXY_USER_CREATION=1
+export TRUSTED_REVERSE_PROXY_NETWORKS=127.0.0.1/32
+export DISABLE_LOCAL_AUTH=1
+
 export FORCE_REFRESH_INTERVAL=1
 
-# Derive base URL from OpenHost environment variables
+# Derive base URL from OpenHost environment variables so Miniflux generates
+# correct absolute URLs (cookies, OPML links, emails, etc.).
 if [ -n "$OPENHOST_ZONE_DOMAIN" ]; then
     APP_SUBDOMAIN="${OPENHOST_APP_NAME:-miniflux}"
     DOMAIN_NAME="${APP_SUBDOMAIN}.${OPENHOST_ZONE_DOMAIN}"
@@ -100,4 +103,31 @@ if [ -n "$OPENHOST_ZONE_DOMAIN" ]; then
     esac
 fi
 
-exec /usr/bin/miniflux
+# ---------------------------------------------------------------------------
+# Launch miniflux in the background, then the auth-proxy sidecar in the
+# foreground. If either exits, kill both so OpenHost restarts the container.
+# ---------------------------------------------------------------------------
+echo "[start.sh] Starting miniflux on 127.0.0.1:8081"
+/usr/bin/miniflux &
+MINIFLUX_PID=$!
+
+# Give miniflux a moment to bind the socket before the sidecar starts
+# accepting requests. Not strictly required (the sidecar returns 502 until
+# miniflux is up), but avoids a noisy first-request failure.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0) if not s.connect_ex(("127.0.0.1", 8081)) else sys.exit(1)' 2>/dev/null; then
+        break
+    fi
+    sleep 0.5
+done
+
+# If the miniflux process already died, surface the exit code.
+if ! kill -0 "$MINIFLUX_PID" 2>/dev/null; then
+    wait "$MINIFLUX_PID"
+    exit $?
+fi
+
+trap 'kill -TERM "$MINIFLUX_PID" 2>/dev/null; wait' TERM INT
+
+echo "[start.sh] Starting auth-proxy on 0.0.0.0:8080"
+exec /opt/auth-venv/bin/python3 /app/auth_proxy.py

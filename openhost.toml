@@ -1,7 +1,7 @@
 [app]
 name = "miniflux"
-version = "0.1.0"
-description = "Miniflux minimalist RSS reader with built-in PostgreSQL"
+version = "0.2.0"
+description = "Miniflux minimalist RSS reader with built-in PostgreSQL and OpenHost SSO"
 
 [runtime.container]
 image = "Dockerfile"
@@ -9,7 +9,11 @@ port = 8080
 
 [routing]
 health_check = "/healthcheck"
-public_paths = ["/"]
+# Only the health-check endpoint is unauthenticated so the OpenHost router
+# can probe liveness. Every other path goes through the container's
+# auth-proxy sidecar which enforces the zone_auth cookie -- so even inside
+# the container Miniflux itself is reachable only after SSO succeeds.
+public_paths = ["/healthcheck"]
 
 [resources]
 memory_mb = 512
