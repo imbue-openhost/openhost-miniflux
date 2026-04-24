@@ -216,7 +216,11 @@ def _strip_headers(
 
 
 class AuthProxyHandler(BaseHTTPRequestHandler):
-    jwks: JwksCache
+    # `jwks` is set by main() before the server is started. The ClassVar
+    # default of None guards against construction order bugs (e.g. a test
+    # that instantiates the handler without running main()): a clear
+    # RuntimeError is friendlier than an AttributeError at request time.
+    jwks: JwksCache | None = None
     miniflux_host: str = "127.0.0.1"
     miniflux_port: int = 8081
 
@@ -281,21 +285,32 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             HOP_BY_HOP_HEADERS | {AUTH_HEADER_NAME.lower(), "content-length"},
         )
 
-        # Decide whether this request carries an owner's signed cookie.
+        # Decide whether this request carries an owner's signed cookie. The
+        # jwks class attribute should always be set by main() before the
+        # server accepts requests; if not, fail closed rather than letting
+        # a None deref crash the handler.
+        if self.jwks is None:
+            log.error("auth-proxy JWKS not initialised; refusing request")
+            self.send_error(503, "auth-proxy not initialised")
+            return
         cookies = _parse_cookie_header(self.headers.get("Cookie"))
         token = cookies.get(ZONE_COOKIE, "")
         is_owner = _verify_owner(token, self.jwks)
         if is_owner:
             cleaned_headers.append((AUTH_HEADER_NAME, "admin"))
 
-        # Reject chunked transfer encoding outright. We buffer the body into
-        # a new Content-Length request; forwarding the raw chunked bytes as
-        # a plain body would corrupt the upstream's parse, and implementing
-        # dechunking here duplicates what the fronting OpenHost router
-        # (httpx-based) already does before it reaches us.
+        # Reject chunked (and any other non-identity) transfer encoding
+        # outright. We buffer the body into a new Content-Length request;
+        # forwarding the raw chunked bytes as a plain body would corrupt
+        # the upstream's parse, and implementing dechunking here duplicates
+        # what the fronting OpenHost router (httpx-based) already does
+        # before it reaches us. 501 is the correct status code: the
+        # semantic issue is "we do not implement this transfer-coding", not
+        # "please add Content-Length and try again" (which 411 would imply
+        # and which would send a client into a retry loop).
         transfer_encoding = self.headers.get("Transfer-Encoding", "").lower().strip()
         if transfer_encoding and transfer_encoding != "identity":
-            self.send_error(411, "Length Required (Transfer-Encoding unsupported)")
+            self.send_error(501, "Transfer-Encoding not supported")
             return
 
         body: bytes | None = None
@@ -314,7 +329,23 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 # could advertise a multi-GiB body and exhaust container RAM.
                 self.send_error(413, "request body too large")
                 return
-            body = self.rfile.read(length) if length > 0 else b""
+            if length > 0:
+                try:
+                    body = self.rfile.read(length)
+                except (OSError, TimeoutError) as exc:
+                    # Client dropped the connection or the socket timeout
+                    # we set at the top of _proxy() fired. Return 400 so
+                    # the client sees a clean response instead of a raw
+                    # traceback in the server log.
+                    log.info("client read error: %s", exc)
+                    try:
+                        self.send_error(400, "request body read failed")
+                    except OSError:
+                        # Client is already gone; nothing left to say.
+                        pass
+                    return
+            else:
+                body = b""
         elif self.command in ("POST", "PUT", "PATCH", "DELETE"):
             # Body method with no Content-Length and no Transfer-Encoding.
             # The HTTP spec says this means "no body" for a request (unlike a
@@ -392,9 +423,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
                 return
             try:
                 self.wfile.write(payload)
-            except (BrokenPipeError, ConnectionResetError):
-                # Client went away mid-response; nothing to do.
-                pass
+            except OSError as exc:
+                # BrokenPipeError, ConnectionResetError, TimeoutError, and
+                # ECONNABORTED are all signals that the client went away
+                # mid-response. Nothing we can do except log at debug and
+                # avoid crashing the handler thread.
+                log.debug("client disconnected mid-response: %s", exc)
         finally:
             conn.close()
 
@@ -443,7 +477,18 @@ def main() -> int:
     AuthProxyHandler.jwks = jwks
     AuthProxyHandler.miniflux_port = miniflux_port
 
-    server = IPv4ThreadingServer(("0.0.0.0", listen_port), AuthProxyHandler)
+    try:
+        server = IPv4ThreadingServer(("0.0.0.0", listen_port), AuthProxyHandler)
+    except OSError as exc:
+        # Typically "address already in use" if something else is already
+        # bound. Fail with a clear message instead of a raw traceback so
+        # the operator can see what's wrong in the container logs.
+        log.error(
+            "failed to bind auth-proxy listener on 0.0.0.0:%d: %s",
+            listen_port,
+            exc,
+        )
+        return 1
     log.info(
         "listening on 0.0.0.0:%d -> 127.0.0.1:%d (router=%s)",
         listen_port,

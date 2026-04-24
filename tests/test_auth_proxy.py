@@ -3,9 +3,9 @@
 Run: `pip install 'PyJWT[crypto]==2.9.0' requests pytest`, then
 `pytest tests/ -q` from the repo root.
 
-These tests do not exercise the HTTP handler's socket I/O (that's covered by
-the end-to-end tests documented in the README). They cover the pure helpers
-that matter for security: JWT verification and cookie parsing.
+Scope: the pure helpers that matter for security — JWT verification, cookie
+parsing, and header stripping. The HTTP handler's socket I/O is exercised
+at deploy time by smoke-testing an actual deployed instance (see README).
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def keypair() -> tuple[bytes, dict]:
 
 
 @pytest.fixture
-def jwks_with(keypair) -> _StubCache:
+def stub_jwks(keypair) -> _StubCache:
     _, jwk = keypair
     return _StubCache(jwk)
 
@@ -92,41 +92,41 @@ def _token(pem: bytes, sub: str, exp_offset: int = 3600, alg: str = "RS256") -> 
 # ----------------------------------------------------------------- _verify_owner
 
 
-def test_valid_owner_token_passes(keypair, jwks_with):
+def test_valid_owner_token_passes(keypair, stub_jwks):
     pem, _ = keypair
-    assert auth_proxy._verify_owner(_token(pem, "owner"), jwks_with) is True
+    assert auth_proxy._verify_owner(_token(pem, "owner"), stub_jwks) is True
 
 
-def test_expired_owner_token_fails(keypair, jwks_with):
+def test_expired_owner_token_fails(keypair, stub_jwks):
     pem, _ = keypair
-    assert auth_proxy._verify_owner(_token(pem, "owner", exp_offset=-10), jwks_with) is False
+    assert auth_proxy._verify_owner(_token(pem, "owner", exp_offset=-10), stub_jwks) is False
 
 
-def test_non_owner_subject_fails(keypair, jwks_with):
+def test_non_owner_subject_fails(keypair, stub_jwks):
     pem, _ = keypair
-    assert auth_proxy._verify_owner(_token(pem, "guest"), jwks_with) is False
+    assert auth_proxy._verify_owner(_token(pem, "guest"), stub_jwks) is False
 
 
-def test_missing_token_fails(jwks_with):
-    assert auth_proxy._verify_owner("", jwks_with) is False
+def test_missing_token_fails(stub_jwks):
+    assert auth_proxy._verify_owner("", stub_jwks) is False
 
 
-def test_garbage_token_fails(jwks_with):
-    assert auth_proxy._verify_owner("not.a.jwt", jwks_with) is False
+def test_garbage_token_fails(stub_jwks):
+    assert auth_proxy._verify_owner("not.a.jwt", stub_jwks) is False
 
 
-def test_token_signed_by_unknown_key_fails(jwks_with):
+def test_token_signed_by_unknown_key_fails(stub_jwks):
     other_pem, _ = _make_keypair()
-    assert auth_proxy._verify_owner(_token(other_pem, "owner"), jwks_with) is False
+    assert auth_proxy._verify_owner(_token(other_pem, "owner"), stub_jwks) is False
 
 
-def test_token_missing_exp_fails(keypair, jwks_with):
+def test_token_missing_exp_fails(keypair, stub_jwks):
     pem, _ = keypair
     no_exp = jwt.encode({"sub": "owner"}, pem, algorithm="RS256")
-    assert auth_proxy._verify_owner(no_exp, jwks_with) is False
+    assert auth_proxy._verify_owner(no_exp, stub_jwks) is False
 
 
-def test_hs256_token_rejected(jwks_with):
+def test_hs256_token_rejected(stub_jwks):
     """Only RS256 is accepted; algorithm confusion must not let an attacker
     forge a token by treating the public key as an HMAC secret."""
     now = int(time.time())
@@ -135,18 +135,18 @@ def test_hs256_token_rejected(jwks_with):
         "symmetric-secret",
         algorithm="HS256",
     )
-    assert auth_proxy._verify_owner(hs, jwks_with) is False
+    assert auth_proxy._verify_owner(hs, stub_jwks) is False
 
 
-def test_valid_owner_token_with_multiple_keys(keypair, jwks_with):
+def test_valid_owner_token_with_multiple_keys(keypair, stub_jwks):
     """During JWKS key rotation we briefly have two keys; the loop must try
     both rather than giving up after a verify-with-non-owner-sub on the wrong
     key."""
     # Add a second (non-signing) key to the cache.
     _, other_jwk = _make_keypair()
-    jwks_with.add_key(other_jwk)
+    stub_jwks.add_key(other_jwk)
     pem, _ = keypair
-    assert auth_proxy._verify_owner(_token(pem, "owner"), jwks_with) is True
+    assert auth_proxy._verify_owner(_token(pem, "owner"), stub_jwks) is True
 
 
 # ------------------------------------------------------------- _parse_cookie_header
@@ -223,3 +223,60 @@ def test_port_from_env_rejects_out_of_range(monkeypatch):
     monkeypatch.setenv("TEST_PORT_VAR", "70000")
     with pytest.raises(ValueError):
         auth_proxy._port_from_env("TEST_PORT_VAR", 1)
+
+
+# ----------------------------------------------------------------- JwksCache
+
+
+def test_jwks_cache_returns_stale_keys_on_refresh_failure(keypair, monkeypatch):
+    """If a JWKS refresh fails and we have a previously-cached key, return
+    the stale cache rather than failing closed and locking the owner out."""
+    _, jwk = keypair
+    good_keys = [jwt.algorithms.RSAAlgorithm.from_jwk(jwk)]
+
+    cache = auth_proxy.JwksCache("http://router.invalid")
+
+    # First call: return a valid key.
+    fetch_calls = []
+
+    def _fake_fetch() -> list:
+        fetch_calls.append(time.time())
+        if len(fetch_calls) == 1:
+            return good_keys
+        raise RuntimeError("router unreachable")
+
+    monkeypatch.setattr(cache, "_fetch", _fake_fetch)
+
+    assert cache.get() is not None
+    # Force the TTL to expire so the next get() triggers a refresh attempt.
+    cache._fetched_at = 0
+    keys = cache.get()
+    assert keys == good_keys, "stale cache should be returned on refresh failure"
+    assert len(fetch_calls) == 2
+
+
+def test_jwks_cache_fails_closed_when_no_cache_and_fetch_fails(monkeypatch):
+    """With no prior successful fetch, a fetch error must propagate so that
+    _verify_owner can fail closed rather than silently letting requests
+    through unauthenticated."""
+    cache = auth_proxy.JwksCache("http://router.invalid")
+
+    def _fake_fetch() -> list:
+        raise RuntimeError("never reachable")
+
+    monkeypatch.setattr(cache, "_fetch", _fake_fetch)
+    with pytest.raises(RuntimeError):
+        cache.get()
+
+
+def test_verify_owner_fails_closed_when_jwks_unavailable(keypair, monkeypatch):
+    """Integration between _verify_owner and JwksCache: a valid-looking token
+    must be rejected when the cache can't return any keys at all."""
+    pem, _ = keypair
+    cache = auth_proxy.JwksCache("http://router.invalid")
+
+    def _raise() -> list:
+        raise RuntimeError("no cache, no fetch")
+
+    monkeypatch.setattr(cache, "get", _raise)
+    assert auth_proxy._verify_owner(_token(pem, "owner"), cache) is False
