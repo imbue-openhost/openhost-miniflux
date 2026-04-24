@@ -283,3 +283,61 @@ def test_verify_owner_fails_closed_when_jwks_unavailable(keypair, monkeypatch):
 
     monkeypatch.setattr(cache, "get", _raise)
     assert auth_proxy._verify_owner(_token(pem, "owner"), cache) is False
+
+
+def test_jwks_fetch_skips_malformed_entries(keypair, monkeypatch):
+    """A JWKS containing a malformed entry alongside a valid one should
+    yield the valid key. This defends against a future key rotation that
+    temporarily introduces an unparseable key — we should keep accepting
+    the good one rather than locking the owner out entirely."""
+    _, good_jwk = keypair
+    cache = auth_proxy.JwksCache("http://router.invalid")
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"keys": [good_jwk, {"kty": "RSA", "broken": True}]}
+
+    monkeypatch.setattr(auth_proxy.requests, "get", lambda *a, **kw: _FakeResp())
+    keys = cache._fetch()
+    assert len(keys) == 1
+
+
+def test_jwks_fetch_raises_when_all_entries_malformed(monkeypatch):
+    cache = auth_proxy.JwksCache("http://router.invalid")
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"keys": [{"kty": "RSA", "broken": True}]}
+
+    monkeypatch.setattr(auth_proxy.requests, "get", lambda *a, **kw: _FakeResp())
+    with pytest.raises(RuntimeError, match="no usable keys"):
+        cache._fetch()
+
+
+def test_jwks_prefetch_swallows_errors(monkeypatch, caplog):
+    cache = auth_proxy.JwksCache("http://router.invalid")
+
+    def _raise() -> list:
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(cache, "_fetch", _raise)
+    # Should NOT raise; just log a warning.
+    cache.prefetch()

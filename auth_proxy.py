@@ -432,14 +432,19 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             # distinguish "cap reached, probably more available" from
             # "legitimate body just under the cap".
             try:
-                try:
-                    payload = upstream.read(self.MAX_BODY_BYTES + 1)
-                finally:
-                    upstream.close()
+                payload = upstream.read(self.MAX_BODY_BYTES + 1)
             except (OSError, http.client.HTTPException) as exc:
                 log.warning("upstream read error: %s", exc)
                 self._safe_send_error(502, "Bad Gateway")
+                try:
+                    upstream.close()
+                except Exception:  # noqa: BLE001 - best effort only
+                    pass
                 return
+            try:
+                upstream.close()
+            except Exception as exc:  # noqa: BLE001 - best effort only
+                log.debug("upstream.close() raised (ignored): %s", exc)
             if len(payload) > self.MAX_BODY_BYTES:
                 log.warning(
                     "upstream response exceeded %d bytes; returning 502",
@@ -455,8 +460,14 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             # whole body. The whole block writes to the client socket, so a
             # disconnect here surfaces as OSError; swallow it the same way
             # we do for the body write below.
+            #
+            # `upstream.reason` can legitimately be None (RFC 9110 §6.2
+            # allows a bare status line with no reason phrase); fall back
+            # to an empty string so send_response doesn't emit
+            # "HTTP/1.1 200 None".
+            reason = upstream.reason or ""
             try:
-                self.send_response(upstream.status, upstream.reason)
+                self.send_response(upstream.status, reason)
                 for key, value in upstream.getheaders():
                     if key.lower() in HOP_BY_HOP_HEADERS:
                         continue
