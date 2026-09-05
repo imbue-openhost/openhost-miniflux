@@ -13,6 +13,7 @@ COPY --from=miniflux /usr/bin/miniflux /usr/bin/miniflux
 
 COPY start.sh /app/start.sh
 COPY auth_proxy.py /app/auth_proxy.py
+COPY auto_subscribe.py /app/auto_subscribe.py
 RUN chmod +x /app/start.sh
 
 RUN mkdir -p /run/postgresql && chown postgres:postgres /run/postgresql

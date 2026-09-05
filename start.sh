@@ -6,6 +6,13 @@ set -e
 
 PERSIST="${OPENHOST_APP_DATA_DIR:-/data}"
 PG_DATA="$PERSIST/pgdata"
+AUTO_SUBSCRIBE_PENDING="$PERSIST/.auto_subscribe_pending"
+
+# App-defined feeds are installed once, when persistent storage is first
+# initialized. Add future onboarding feeds to this list.
+AUTO_SUBSCRIBE_FEEDS=(
+    "https://github.com/cloud-in-a-bottle/cloud-in-a-bottle/releases.atom"
+)
 
 mkdir -p "$PERSIST"
 
@@ -17,6 +24,7 @@ chown postgres:postgres /run/postgresql
 # Initialize PostgreSQL on first boot
 # ---------------------------------------------------------------------------
 if [ ! -f "$PG_DATA/PG_VERSION" ]; then
+    touch "$AUTO_SUBSCRIBE_PENDING"
     mkdir -p "$PG_DATA"
     chown postgres:postgres "$PG_DATA"
     su postgres -c "initdb -D '$PG_DATA' --auth=trust"
@@ -152,6 +160,18 @@ done
 if ! kill -0 "$MINIFLUX_PID" 2>/dev/null; then
     wait "$MINIFLUX_PID"
     exit $?
+fi
+
+# Complete fresh-install setup through Miniflux itself so feed parsing and
+# validation follow normal application behavior. A failed attempt leaves the
+# marker in place for the next restart; success removes it permanently.
+if [ -f "$AUTO_SUBSCRIBE_PENDING" ]; then
+    echo "[start.sh] Installing first-start feed subscriptions"
+    if python3 /app/auto_subscribe.py --port "$MINIFLUX_UPSTREAM_PORT" "${AUTO_SUBSCRIBE_FEEDS[@]}"; then
+        rm -f "$AUTO_SUBSCRIBE_PENDING"
+    else
+        echo "[start.sh] First-start feed subscriptions failed; will retry after restart" >&2
+    fi
 fi
 
 echo "[start.sh] Starting auth-proxy on 0.0.0.0:8080"
