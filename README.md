@@ -8,6 +8,12 @@ On first boot, the container:
 3. Runs Miniflux migrations.
 4. Starts Miniflux on `127.0.0.1:8081` behind a tiny auth-proxy sidecar on port 8080.
 5. Derives `BASE_URL` from `OPENHOST_ZONE_DOMAIN` / `OPENHOST_APP_NAME` / `OPENHOST_ROUTER_URL`.
+6. Subscribes the owner to the Cloud in a Bottle GitHub releases feed.
+
+First-start subscriptions are defined by `AUTO_SUBSCRIBE_FEEDS` in `start.sh`.
+They run only for newly initialized persistent storage. If setup is interrupted,
+it resumes on the next start; after setup succeeds, removing a feed does not
+cause it to be recreated.
 
 ## Authentication
 
@@ -84,6 +90,7 @@ commands above.
 ## Files
 
 - `Dockerfile` — multi-stage build: extracts the Miniflux binary, then adds PostgreSQL and Python 3 on Alpine.
-- `start.sh` — initializes PostgreSQL, configures Miniflux via env vars, starts Miniflux on loopback, then starts the auth-proxy sidecar; supervises both so the container exits (and is restarted by Cloud in a Bottle) if either child dies.
+- `start.sh` — initializes PostgreSQL, configures Miniflux and first-start feeds, starts Miniflux on loopback, then starts the auth-proxy sidecar; supervises both so the container exits (and is restarted by Cloud in a Bottle) if either child dies.
+- `auto_subscribe.py` — installs app-defined feeds through Miniflux's normal subscription flow on a fresh installation.
 - `auth_proxy.py` — the reverse proxy that translates Cloud in a Bottle's `X-OpenHost-Is-Owner` signal into Miniflux's auth-proxy header.
 - `openhost.toml` — Cloud in a Bottle app manifest. Only `/healthcheck` and `/js/` are marked as public paths.
