@@ -18,6 +18,7 @@ class _MinifluxHandler(BaseHTTPRequestHandler):
         if self.path == "/":
             assert self.headers["X-Openhost-User"] == "admin"
             self.send_response(302)
+            self.send_header("Set-Cookie", "session=anonymous; Path=/; Secure; HttpOnly")
             self.send_header("Set-Cookie", "session=secret; Path=/; Secure; HttpOnly")
             self.send_header("Location", "/unread")
             self.end_headers()

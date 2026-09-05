@@ -52,14 +52,17 @@ def _open(opener, request: urllib.request.Request, expected: set[int]):
 
 
 def _cookie_header(headers) -> str:
-    cookies: list[str] = []
+    cookies: dict[str, str] = {}
     for value in headers.get_all("Set-Cookie", []):
         parsed = http.cookies.SimpleCookie()
         parsed.load(value)
-        cookies.extend(f"{name}={morsel.value}" for name, morsel in parsed.items())
+        for name, morsel in parsed.items():
+            # Miniflux rotates the anonymous session during proxy login and
+            # sends the replacement cookie with the same name.
+            cookies[name] = morsel.value
     if not cookies:
         raise RuntimeError("Miniflux did not create an authentication session")
-    return "; ".join(cookies)
+    return "; ".join(f"{name}={value}" for name, value in cookies.items())
 
 
 def subscribe(feed_urls: list[str], base_url: str = "http://127.0.0.1:8081") -> None:
